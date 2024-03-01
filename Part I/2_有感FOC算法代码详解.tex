@@ -1,0 +1,172 @@
+\documentclass[main.tex]{subfiles}
+\begin{document}
+\section{有感FOC算法代码详解}
+\subsection{Clark变换}
+\begin{lstlisting}[language=C]
+void Clark_Transform(FOC_Typedef_t *foc)
+{
+    foc->Curr.Ia = adc.Current[0];
+    foc->Curr.Ib = adc.Current[1];
+    foc->Curr.Ic = adc.Current[2];
+    // Ia + Ib + Ic = 0
+    foc->Curr.Ialpha = foc->Curr.Ia;
+    foc->Curr.Ibeta = SQRT3_3 * (foc->Curr.Ia + 2.0f * foc->Curr.Ib);
+}
+\end{lstlisting}
+
+\subsection{Park变换}
+\begin{lstlisting}[language=C]
+void Park_Transform(FOC_Typedef_t *foc)
+{
+    foc->Curr.Id = foc->Curr.Ialpha * foc->cos_theta 
+                 + foc->Curr.Ibeta * foc->sin_theta;
+    foc->Curr.Iq = -foc->Curr.Ialpha * foc->sin_theta 
+                 + foc->Curr.Ibeta * foc->cos_theta;
+}
+\end{lstlisting}
+\subsection{电流闭环}
+\begin{lstlisting}[language=C]
+void PID_Current_Loop_Calc(FOC_Typedef_t *foc)
+{
+	PID_Calc(&Id_Pid,foc->Curr.Id,foc->Curr.Id_set);
+	PID_Calc(&Iq_Pid,foc->Curr.Iq,foc->Curr.Iq_set);
+	foc->Volt.Vd = Id_Pid.out;
+	foc->Volt.Vq = Iq_Pid.out;
+}
+\end{lstlisting}
+PID基础及PID计算函数略过不讲。
+
+\subsection{逆Park变换}
+\begin{lstlisting}[language=C]
+void InvPark_Transform(FOC_Typedef_t *foc)
+{
+    foc->Volt.Valpha = foc->Volt.Vd * foc->cos_theta 
+                     - foc->Volt.Vq * foc->sin_theta;
+    foc->Volt.Vbeta = foc->Volt.Vd * foc->sin_theta 
+                    + foc->Volt.Vq * foc->cos_theta;
+}
+\end{lstlisting}
+
+\subsection{SVPWM}
+\begin{lstlisting}[language=C]
+void SVPWM_Calc(FOC_Typedef_t *foc)
+{
+	uint8_t A, B, C, N;
+	fp32 Uref1, Uref2, Uref3;
+	fp32 X, Y, Z;
+	int16_t T0, T1, T2;
+	int16_t Ta, Tb, Tc;
+		
+	Uref1 = foc->Volt.Vbeta;
+	Uref2 = SQRT3_2 * foc->Volt.Valpha - 0.5f * foc->Volt.Vbeta;
+	Uref3 = - SQRT3_2 * foc->Volt.Valpha - 0.5f * foc->Volt.Vbeta;
+	// A, B and C are the temp flag to calculate the sector of the motor
+	if (Uref1 > 0.0f) A = 1; else A = 0;
+	if (Uref2 > 0.0f) B = 1; else B = 0;
+	if (Uref3 > 0.0f) C = 1; else C = 0;
+	// N is one-to-one mapping of the sector
+	N = 4 * C + 2 * B + A;
+	// X, Y and Z can help to get T0, T4 and T6
+	X = SQRT3 * foc->Volt.Vbeta * PWM_TS / adc.Vbus;
+	Y = 1.5f * foc->Volt.Valpha * PWM_TS / adc.Vbus 
+          + SQRT3_2 * foc->Volt.Vbeta * PWM_TS / adc.Vbus;
+	Z = -1.5f * foc->Volt.Valpha * PWM_TS / adc.Vbus 
+          + SQRT3_2 * foc->Volt.Vbeta * PWM_TS / adc.Vbus;
+	// T1 is T4, and T2 is T6, actually the SECTOR1 to SECTOR2 is not 
+        // the real sector, they are also one-to-one mapping of the sector
+	switch (N) {
+		case SECTOR1: {
+		  T1 = Z;
+		  T2 = Y;
+		  break;
+		}
+		case SECTOR2: {
+		  T1 = Y;
+		  T2 = -X;
+		  break;
+		}
+		case SECTOR3: {
+		  T1 = -Z;
+		  T2 = X;
+		  break;
+		}
+		case SECTOR4: {
+		  T1 = -X;
+                  T2 = Z;
+		  break;
+		}
+		case SECTOR5: {
+		  T1 = X;
+                  T2 = -Y;
+		  break;
+		}
+		case SECTOR6: {
+		  T1 = -Y;
+                  T2 = -Z;
+		  break;
+		}
+		default: {
+		  T1 = 0;
+                  T2 = 0;
+                  break;
+		}
+	}
+	// The T1, T2 and T0 can not over the maximum PWM shadow register
+	PWM_Output_Limit(T1);
+	PWM_Output_Limit(T2);
+	Over_Modulation(T1, T2);
+	T0 = (PWM_TS - T1 - T2) / 2;
+        PWM_Output_Limit(T0);
+	// Seven-segment SVPWM time switching point calculation, and put the 
+	// answers to CCR registers
+	Ta = (PWM_TS - T1 - T2)/4;
+	Tb = Ta + T1/2;
+	Tc = Tb + T2/2;
+	switch(N)
+	{
+		case SECTOR1: {
+			TIM1->CCR1 = (Tb);
+			TIM1->CCR2 = (Ta);
+			TIM1->CCR3 = (Tc);
+			break;
+		}
+		case SECTOR2: {
+			TIM1->CCR1 = (Ta);
+                        TIM1->CCR2 = (Tc);
+			TIM1->CCR3 = (Tb);
+                        break;
+		}
+		case SECTOR3: {
+			TIM1->CCR1 = (Ta);
+			TIM1->CCR2 = (Tb);
+			TIM1->CCR3 = (Tc);
+			break;
+		}
+		case SECTOR4: {
+			TIM1->CCR1 = (Tc);
+                        TIM1->CCR2 = (Tb);
+			TIM1->CCR3 = (Ta);
+			break;
+		}
+		case SECTOR5: {
+			TIM1->CCR1 = (Tc);
+			TIM1->CCR2 = (Ta);
+			TIM1->CCR3 = (Tb);
+			break;
+		}
+		case SECTOR6: {
+			TIM1->CCR1 = (Tb);
+                        TIM1->CCR2 = (Tc);
+                        TIM1->CCR3 = (Ta);
+                        break;
+		}
+		default: {
+			TIM1->CCR1 = PWM_TS * 0.5f;
+			TIM1->CCR2 = PWM_TS * 0.5f;
+			TIM1->CCR3 = PWM_TS * 0.5f;
+			break;
+		}
+	}
+}
+\end{lstlisting}
+\end{document}
